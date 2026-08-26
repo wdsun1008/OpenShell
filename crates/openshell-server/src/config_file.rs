@@ -130,6 +130,10 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Require sandbox principals to use a distinct compute-driver callback
+    /// listener and reject user principals on that listener.
+    #[serde(default)]
+    pub exclusive_sandbox_callback: Option<bool>,
 
     // ── Shared driver defaults (inherited into [openshell.drivers.<name>]) ─
     #[serde(default)]

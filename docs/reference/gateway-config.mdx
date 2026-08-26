@@ -96,6 +96,9 @@ policy_validation_failure_mode = "fail_closed"
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
+# Opt-in isolation for an external compute driver's sandbox callback listener.
+# The gateway fails startup unless the driver requests a distinct address.
+exclusive_sandbox_callback = false
 
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false
@@ -200,7 +203,7 @@ namespace = "openshell"
 allow_reference_namespace = false
 ```
 
-Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments normally use OIDC or a trusted access proxy. A Kubernetes deployment may combine mTLS user authentication with `exclusive_sandbox_callback = true` only when its compute driver requests a distinct callback listener: the callback listener accepts sandbox principals and sandbox-callable RPCs only, while the primary listener rejects sandbox principals. Startup fails if the requested address is covered by the primary listener instead of being bound separately. The option is disabled by default and the Helm chart does not enable it.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 

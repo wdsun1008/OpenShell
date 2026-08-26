@@ -214,6 +214,15 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_loopback_service_http: bool,
+
+    /// Isolate sandbox RPCs onto a distinct compute-driver callback listener.
+    #[arg(
+        long,
+        env = "OPENSHELL_EXCLUSIVE_SANDBOX_CALLBACK",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    exclusive_sandbox_callback: bool,
 }
 
 pub fn command() -> Command {
@@ -290,9 +299,12 @@ fn prepare_server_config(
             "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
         ));
     }
-    if mtls_auth_enabled && matches!(compute_driver_kind, Some(ComputeDriverKind::Kubernetes)) {
+    if mtls_auth_enabled
+        && matches!(compute_driver_kind, Some(ComputeDriverKind::Kubernetes))
+        && !args.exclusive_sandbox_callback
+    {
         return Err(miette::miette!(
-            "mTLS user authentication is not supported with the Kubernetes compute driver. Configure OIDC or a trusted fronting proxy for user authentication."
+            "mTLS user authentication with the Kubernetes compute driver requires --exclusive-sandbox-callback so user and sandbox principals use separate listeners."
         ));
     }
 
@@ -407,7 +419,8 @@ fn prepare_server_config(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
-        .with_loopback_service_http(args.enable_loopback_service_http);
+        .with_loopback_service_http(args.enable_loopback_service_http)
+        .with_exclusive_sandbox_callback(args.exclusive_sandbox_callback);
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -684,6 +697,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_loopback_service_http")
     {
         args.enable_loopback_service_http = enabled;
+    }
+    if let Some(enabled) = file.exclusive_sandbox_callback
+        && arg_defaulted(matches, "exclusive_sandbox_callback")
+    {
+        args.exclusive_sandbox_callback = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
@@ -1023,6 +1041,27 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(cli.run.enable_mtls_auth);
+    }
+
+    #[test]
+    fn command_keeps_exclusive_sandbox_callbacks_opt_in() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_EXCLUSIVE_SANDBOX_CALLBACK");
+
+        let default =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert!(!default.run.exclusive_sandbox_callback);
+
+        let enabled = Cli::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--exclusive-sandbox-callback=true",
+        ])
+        .unwrap();
+        assert!(enabled.run.exclusive_sandbox_callback);
     }
 
     #[test]
@@ -1400,6 +1439,46 @@ mod tests {
             None,
             Some(openshell_core::ComputeDriverKind::Kubernetes)
         ));
+    }
+
+    #[test]
+    fn kubernetes_mtls_requires_explicit_callback_isolation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config.path().to_str().unwrap());
+        let _mtls = EnvVarGuard::remove("OPENSHELL_ENABLE_MTLS_AUTH");
+        let registry = crate::ComputeDriverRegistry::new();
+        let base = [
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "kubernetes",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+            "--enable-mtls-auth=true",
+        ];
+
+        let (mut args, matches) = parse_with_args(&base);
+        let Err(error) = super::prepare_server_config(&mut args, &matches, &registry) else {
+            panic!("Kubernetes mTLS must fail without callback isolation");
+        };
+        assert!(error.to_string().contains("exclusive-sandbox-callback"));
+
+        let mut isolated = base.to_vec();
+        isolated.push("--exclusive-sandbox-callback=true");
+        let (mut args, matches) = parse_with_args(&isolated);
+        let prepared = super::prepare_server_config(&mut args, &matches, &registry).unwrap();
+        assert!(prepared.config.mtls_auth.enabled);
+        assert!(prepared.config.exclusive_sandbox_callback);
     }
 
     #[test]
@@ -1811,6 +1890,7 @@ ssh_session_ttl_secs = 1234
 [openshell.gateway]
 server_sans                  = ["gateway.local", "*.dev.openshell.localhost"]
 enable_loopback_service_http = false
+exclusive_sandbox_callback   = true
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
@@ -1823,6 +1903,7 @@ enable_loopback_service_http = false
             ]
         );
         assert!(!args.enable_loopback_service_http);
+        assert!(args.exclusive_sandbox_callback);
     }
 
     #[test]

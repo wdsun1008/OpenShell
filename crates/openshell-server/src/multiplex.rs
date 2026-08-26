@@ -289,6 +289,7 @@ impl MultiplexService {
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
+            self.state.config.exclusive_sandbox_callback,
         );
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
@@ -911,6 +912,7 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    exclusive_sandbox_callback: bool,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -920,7 +922,15 @@ impl<S> AuthGrpcRouter<S> {
         authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,
     ) -> Self {
-        Self::with_peer_identity(inner, authenticator_chain, authz_policy, None, false, false)
+        Self::with_peer_identity(
+            inner,
+            authenticator_chain,
+            authz_policy,
+            None,
+            false,
+            false,
+            false,
+        )
     }
 
     fn with_peer_identity(
@@ -930,6 +940,7 @@ impl<S> AuthGrpcRouter<S> {
         peer_identity: Option<Identity>,
         mtls_auth_enabled: bool,
         allow_unauthenticated_users: bool,
+        exclusive_sandbox_callback: bool,
     ) -> Self {
         Self {
             inner,
@@ -938,6 +949,7 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            exclusive_sandbox_callback,
         }
     }
 }
@@ -979,6 +991,7 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let exclusive_sandbox_callback = self.exclusive_sandbox_callback;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -1020,6 +1033,34 @@ where
                 // call extract_principal() always find one.
                 unauthenticated_dev_user_principal()
             };
+
+            if exclusive_sandbox_callback {
+                let Some(listener_scope) = req.extensions().get::<GatewayListenerScope>().copied()
+                else {
+                    return Ok(status_response(tonic::Status::permission_denied(
+                        "exclusive sandbox callback request is missing listener scope",
+                    )));
+                };
+                match (listener_scope, &principal) {
+                    (GatewayListenerScope::ComputeDriverCallback, Principal::Sandbox(_))
+                    | (GatewayListenerScope::Primary, Principal::User(_)) => {}
+                    (GatewayListenerScope::ComputeDriverCallback, _) => {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "compute-driver callback listeners require a sandbox principal",
+                        )));
+                    }
+                    (GatewayListenerScope::Primary, Principal::Sandbox(_)) => {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "sandbox principals must use a compute-driver callback listener",
+                        )));
+                    }
+                    (GatewayListenerScope::Primary, Principal::Anonymous) => {
+                        return Ok(status_response(tonic::Status::unauthenticated(
+                            "anonymous callers may not call authenticated methods",
+                        )));
+                    }
+                }
+            }
 
             match principal {
                 Principal::User(ref user) => {
@@ -2521,6 +2562,32 @@ mod tests {
                 .unwrap()
         }
 
+        fn scoped_request(path: &str, scope: GatewayListenerScope) -> Request<Full<Bytes>> {
+            let mut request = empty_request(path);
+            request.extensions_mut().insert(scope);
+            request
+        }
+
+        fn exclusive_router(
+            principal: Principal,
+        ) -> (AuthGrpcRouter<PrincipalRecorder>, RecordedPrincipal) {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(principal))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            (
+                AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                ),
+                seen,
+            )
+        }
+
         fn grpc_status<B>(res: &Response<B>) -> Option<String> {
             res.headers()
                 .get("grpc-status")
@@ -2571,6 +2638,7 @@ mod tests {
                 Some(mtls_identity("openshell-client")),
                 true,
                 false,
+                false,
             );
 
             let res = router
@@ -2599,6 +2667,7 @@ mod tests {
                 Some(mtls_identity("openshell-client")),
                 true,
                 false,
+                false,
             );
 
             let res = router
@@ -2617,7 +2686,7 @@ mod tests {
         async fn mtls_auth_enabled_requires_peer_identity() {
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false);
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false, false);
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -2633,8 +2702,15 @@ mod tests {
             let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
-            let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, false, true);
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                Some(chain),
+                None,
+                None,
+                false,
+                true,
+                false,
+            );
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -2656,7 +2732,7 @@ mod tests {
         async fn unauthenticated_dev_user_authenticates_without_chain_when_enabled() {
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true, false);
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -2724,6 +2800,73 @@ mod tests {
                 seen.lock().unwrap().as_ref(),
                 Some(Principal::Sandbox(_))
             ));
+        }
+
+        #[tokio::test]
+        async fn exclusive_callback_accepts_only_sandbox_principals() {
+            let (mut sandbox_router, sandbox_seen) = exclusive_router(sandbox_principal());
+            let response = sandbox_router
+                .call(scoped_request(
+                    "/openshell.v1.OpenShell/GetSandboxConfig",
+                    GatewayListenerScope::ComputeDriverCallback,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(matches!(
+                sandbox_seen.lock().unwrap().as_ref(),
+                Some(Principal::Sandbox(_))
+            ));
+
+            let (mut user_router, user_seen) = exclusive_router(user_principal("alice"));
+            let response = user_router
+                .call(scoped_request(
+                    "/openshell.v1.OpenShell/GetSandboxConfig",
+                    GatewayListenerScope::ComputeDriverCallback,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(user_seen.lock().unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn exclusive_primary_rejects_sandbox_and_accepts_user() {
+            let (mut sandbox_router, sandbox_seen) = exclusive_router(sandbox_principal());
+            let response = sandbox_router
+                .call(scoped_request(
+                    "/openshell.v1.OpenShell/GetSandboxConfig",
+                    GatewayListenerScope::Primary,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(sandbox_seen.lock().unwrap().is_none());
+
+            let (mut user_router, user_seen) = exclusive_router(user_principal("alice"));
+            let response = user_router
+                .call(scoped_request(
+                    "/openshell.v1.OpenShell/GetSandboxConfig",
+                    GatewayListenerScope::Primary,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(matches!(
+                user_seen.lock().unwrap().as_ref(),
+                Some(Principal::User(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn exclusive_callback_fails_closed_without_listener_scope() {
+            let (mut router, seen) = exclusive_router(sandbox_principal());
+            let response = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(seen.lock().unwrap().is_none());
         }
 
         #[tokio::test]

@@ -308,6 +308,23 @@ pub async fn bind_gateway_listeners(
     Ok(listeners)
 }
 
+/// Prove that confidential callback isolation has a distinct listener.
+///
+/// A wildcard or matching primary listener may satisfy an ordinary driver
+/// requirement without creating a callback-scoped socket. That is useful for
+/// upstream bridge networking, but is not an isolation boundary.
+pub fn require_distinct_callback_listener(listeners: &[BoundGatewayListener]) -> Result<()> {
+    if listeners
+        .iter()
+        .any(|listener| listener.spec.scope == GatewayListenerScope::ComputeDriverCallback)
+    {
+        return Ok(());
+    }
+    Err(Error::config(
+        "exclusive sandbox callbacks require a distinct compute-driver callback listener; the primary listener must not cover the requested callback address",
+    ))
+}
+
 fn resolve_bound_covered_addresses(
     covered_addresses: &[CoveredGatewayAddress],
     requested_listener_addr: SocketAddr,
@@ -376,7 +393,7 @@ mod tests {
     use super::{
         GatewayListenerProvenance, GatewayListenerScope, GatewayListenerSpec,
         bind_gateway_listeners, gateway_listener_specs,
-        gateway_listener_specs_with_default_route_ip,
+        gateway_listener_specs_with_default_route_ip, require_distinct_callback_listener,
     };
     use crate::compute::GatewayListenerRequirement;
     use std::net::SocketAddr;
@@ -396,6 +413,42 @@ mod tests {
             gateway_listener_specs(primary, &requirements).unwrap(),
             vec![primary_listener_spec(primary)]
         );
+    }
+
+    #[tokio::test]
+    async fn exclusive_callback_rejects_wildcard_primary_coverage() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listeners = bind_gateway_listeners(
+            format!("0.0.0.0:{port}").parse().unwrap(),
+            &[docker_listener_requirement(
+                format!("127.0.0.2:{port}").parse().unwrap(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let error = require_distinct_callback_listener(&listeners).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("distinct compute-driver callback")
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_callback_accepts_distinct_listener() {
+        let primary_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = primary_probe.local_addr().unwrap().port();
+        drop(primary_probe);
+        let primary = format!("127.0.0.1:{port}").parse().unwrap();
+        let callback = format!("127.0.0.2:{port}").parse().unwrap();
+        let listeners = bind_gateway_listeners(primary, &[docker_listener_requirement(callback)])
+            .await
+            .unwrap();
+
+        require_distinct_callback_listener(&listeners).unwrap();
     }
 
     #[test]

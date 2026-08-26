@@ -785,6 +785,14 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Isolate sandbox callbacks onto compute-driver-requested listeners.
+    ///
+    /// When enabled, callback listeners accept only sandbox principals and
+    /// the primary listener rejects sandbox principals. Startup also fails
+    /// unless a distinct callback-scoped listener was bound. The default is
+    /// false so existing deployments retain the upstream listener behavior.
+    pub exclusive_sandbox_callback: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -1172,6 +1180,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            exclusive_sandbox_callback: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![
                 GatewayProviderProfileSourceConfig::Builtin,
@@ -1345,6 +1354,13 @@ impl Config {
     #[must_use]
     pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
         self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+
+    /// Require sandbox callbacks to use a distinct callback-scoped listener.
+    #[must_use]
+    pub const fn with_exclusive_sandbox_callback(mut self, enabled: bool) -> Self {
+        self.exclusive_sandbox_callback = enabled;
         self
     }
 }

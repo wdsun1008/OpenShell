@@ -711,6 +711,9 @@ pub(crate) async fn run_server(
         state.compute.gateway_listener_requirements(),
     )
     .await?;
+    if config.exclusive_sandbox_callback {
+        gateway_listener::require_distinct_callback_listener(&gateway_listeners)?;
+    }
 
     if let Err(err) = state.compute.start_persisted_sandboxes().await {
         warn!(error = %err, "Failed to start persisted sandboxes during startup");
