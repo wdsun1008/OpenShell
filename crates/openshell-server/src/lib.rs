@@ -13,6 +13,7 @@
 //! startup. Runtime selection only consults that registry or a configured
 //! external endpoint; it does not switch on driver names.
 
+mod attestation_report;
 mod auth;
 pub mod certgen;
 pub mod cli;
@@ -294,6 +295,9 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
+    /// Optional client for explicit, fresh, display-only sandbox appraisals.
+    pub(crate) attestation_reporter: Option<Arc<attestation_report::AttestationReporter>>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -410,6 +414,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            attestation_reporter: None,
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -452,6 +457,19 @@ pub(crate) async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+
+    let attestation_report_config = config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.attestation_report.as_ref());
+    if attestation_report_config.is_some() && !config.exclusive_sandbox_callback {
+        return Err(Error::config(
+            "attestation_report requires exclusive_sandbox_callback",
+        ));
+    }
+    let attestation_reporter = attestation_report_config
+        .map(attestation_report::AttestationReporter::from_config)
+        .transpose()
+        .map_err(Error::config)?;
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
@@ -653,6 +671,7 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
+    state.attestation_reporter = attestation_reporter.map(Arc::new);
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
     if let Some(issuer) = sandbox_jwt_issuer {

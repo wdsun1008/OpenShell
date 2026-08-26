@@ -29,11 +29,12 @@ use openshell_core::proto::{
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
+    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxAttestationRequest,
+    GetSandboxAttestationResponse, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetServiceRequest,
+    GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
     ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
     IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
     ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
@@ -289,6 +290,13 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         sandbox::handle_get_sandbox(&self.state, request).await
+    }
+
+    async fn get_sandbox_attestation(
+        &self,
+        request: Request<GetSandboxAttestationRequest>,
+    ) -> Result<Response<GetSandboxAttestationResponse>, Status> {
+        sandbox::handle_get_sandbox_attestation(&self.state, request).await
     }
 
     async fn list_sandboxes(

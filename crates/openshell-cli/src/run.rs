@@ -41,21 +41,21 @@ use openshell_core::proto::{
     DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxAttestationRequest,
+    GetSandboxAttestationResponse, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
+    GpuResourceRequirements, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderCredentialRefreshRecoveryAction,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -1388,6 +1388,84 @@ pub async fn sandbox_get(
     }
 
     Ok(())
+}
+
+/// Request and display a fresh Trustee appraisal for one sandbox.
+pub async fn sandbox_attest(
+    server: &str,
+    name: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let appraisal = client
+        .get_sandbox_attestation(GetSandboxAttestationRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if crate::output::print_output_single(output, &appraisal, attestation_to_json)? {
+        return Ok(());
+    }
+
+    println!("{} {}", "EAR status:".dimmed(), appraisal.ear_status);
+    println!("{} {}", "Policy ID:".dimmed(), appraisal.policy_id);
+    if let Some(vector) = &appraisal.ar4si_vector {
+        println!(
+            "{} hardware={} executables={} configuration={} file-system={}",
+            "AR4SI vector:".dimmed(),
+            vector.hardware,
+            vector.executables,
+            vector.configuration,
+            vector.file_system
+        );
+    }
+    println!("{}", "Measurements:".dimmed());
+    for measurement in &appraisal.measurements {
+        let algorithm = if measurement.algorithm.is_empty() {
+            "-"
+        } else {
+            &measurement.algorithm
+        };
+        let measured = if measurement.measurement.is_empty() {
+            "-"
+        } else {
+            &measurement.measurement
+        };
+        println!("  {} ({algorithm})", measurement.component);
+        println!("    {} {measured}", "Measurement:".dimmed());
+        if measurement.references.is_empty() {
+            println!("    {} -", "Reference:".dimmed());
+        } else {
+            for reference in &measurement.references {
+                println!("    {} {reference}", "Reference:".dimmed());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn attestation_to_json(appraisal: &GetSandboxAttestationResponse) -> serde_json::Value {
+    serde_json::json!({
+        "ear_status": appraisal.ear_status,
+        "policy_id": appraisal.policy_id,
+        "ar4si_vector": appraisal.ar4si_vector.as_ref().map(|vector| serde_json::json!({
+            "hardware": vector.hardware,
+            "executables": vector.executables,
+            "configuration": vector.configuration,
+            "file_system": vector.file_system,
+        })),
+        "measurements": appraisal.measurements.iter().map(|measurement| serde_json::json!({
+            "component": measurement.component,
+            "algorithm": measurement.algorithm,
+            "measurement": measurement.measurement,
+            "references": measurement.references,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
@@ -7404,7 +7482,7 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        PolicyGetView, ProvisioningStep, attestation_to_json, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint,
         format_provider_attachment_table, git_sync_files, inferred_provider_type,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
@@ -7429,13 +7507,47 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxStatus, datamodel::v1::ObjectMeta,
+        GetSandboxAttestationResponse, GetSandboxConfigResponse, GpuResourceRequirements,
+        PolicySource, PolicyStatus, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxAttestationMeasurement,
+        SandboxAttestationTrustworthinessVector, SandboxCondition, SandboxPhase,
+        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn attestation_json_contains_only_the_display_contract() {
+        let json = attestation_to_json(&GetSandboxAttestationResponse {
+            ear_status: "affirming".to_string(),
+            policy_id: "peerpod".to_string(),
+            ar4si_vector: Some(SandboxAttestationTrustworthinessVector {
+                hardware: 2,
+                executables: 3,
+                configuration: 2,
+                file_system: 2,
+            }),
+            measurements: vec![SandboxAttestationMeasurement {
+                component: "kernel".to_string(),
+                algorithm: "SHA-384".to_string(),
+                measurement: "aa".repeat(48),
+                references: vec!["aa".repeat(48)],
+            }],
+        });
+
+        let keys = json.as_object().expect("object").keys().collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec!["ar4si_vector", "ear_status", "measurements", "policy_id"]
+        );
+        let measurement = &json["measurements"][0];
+        assert!(measurement.get("measurement").is_some());
+        assert!(measurement.get("references").is_some());
+        for forbidden in ["state", "reason", "message", "evidence", "token", "nonce"] {
+            assert!(json.get(forbidden).is_none());
+            assert!(measurement.get(forbidden).is_none());
+        }
+    }
 
     #[test]
     fn policy_revision_json_includes_revision_provenance() {

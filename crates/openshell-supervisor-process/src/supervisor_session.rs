@@ -38,6 +38,12 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const ATTESTATION_SERVICE_HOST: &str = "127.0.0.1";
+const ATTESTATION_SERVICE_PORT: u16 = 8006;
+
+fn attestation_service_dial_target() -> (&'static str, u16, Option<i32>) {
+    (ATTESTATION_SERVICE_HOST, ATTESTATION_SERVICE_PORT, None)
+}
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
 /// to treating the whole string as a domain if parsing fails.
@@ -99,20 +105,27 @@ fn session_failed_event(
 }
 
 fn relay_target_endpoint(open: &RelayOpen) -> Option<Endpoint> {
-    let relay_open::Target::Tcp(target) = open.target.as_ref()? else {
-        return None;
-    };
-    let host = target.host.trim();
-    let port = u16::try_from(target.port).ok()?;
-    host.parse().map_or_else(
-        |_| Some(Endpoint::from_domain(host, port)),
-        |ip| Some(Endpoint::from_ip(ip, port)),
-    )
+    match open.target.as_ref()? {
+        relay_open::Target::Tcp(target) => {
+            let host = target.host.trim();
+            let port = u16::try_from(target.port).ok()?;
+            host.parse().map_or_else(
+                |_| Some(Endpoint::from_domain(host, port)),
+                |ip| Some(Endpoint::from_ip(ip, port)),
+            )
+        }
+        relay_open::Target::AttestationService(_) => Some(Endpoint::from_ip(
+            ATTESTATION_SERVICE_HOST.parse().expect("fixed ASR address"),
+            ATTESTATION_SERVICE_PORT,
+        )),
+        relay_open::Target::Ssh(_) => None,
+    }
 }
 
 fn relay_target_kind(open: &RelayOpen) -> &'static str {
     match open.target.as_ref() {
         Some(relay_open::Target::Tcp(_)) => "tcp relay",
+        Some(relay_open::Target::AttestationService(_)) => "attestation relay",
         Some(relay_open::Target::Ssh(_)) | None => "ssh relay",
     }
 }
@@ -125,6 +138,9 @@ fn relay_target_message(
     let target = match open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => {
             format!("{}:{}", target.host.trim(), target.port)
+        }
+        Some(relay_open::Target::AttestationService(_)) => {
+            format!("{ATTESTATION_SERVICE_HOST}:{ATTESTATION_SERVICE_PORT}")
         }
         Some(relay_open::Target::Ssh(_)) | None => {
             format!("unix:{}", ssh_socket_path.display())
@@ -719,6 +735,11 @@ async fn open_target(
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
+        Some(relay_open::Target::AttestationService(_)) => {
+            let (host, port, netns_fd) = attestation_service_dial_target();
+            let stream = connect_tcp_target(host.to_string(), port, netns_fd).await?;
+            Ok(Box::new(stream))
+        }
         Some(relay_open::Target::Ssh(_)) | None => {
             let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
             let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
@@ -948,6 +969,16 @@ mod ocsf_event_tests {
         }
     }
 
+    fn attestation_relay_open(channel_id: &str) -> RelayOpen {
+        RelayOpen {
+            channel_id: channel_id.to_string(),
+            target: Some(relay_open::Target::AttestationService(
+                openshell_core::proto::AttestationServiceRelayTarget {},
+            )),
+            service_id: "attestation-report".to_string(),
+        }
+    }
+
     fn ssh_socket_path() -> &'static std::path::Path {
         std::path::Path::new("/run/openshell/ssh.sock")
     }
@@ -1023,6 +1054,23 @@ mod ocsf_event_tests {
                 .map(|c| c.protocol_name.as_str()),
             Some("tcp")
         );
+    }
+
+    #[test]
+    fn attestation_relay_uses_fixed_supervisor_loopback_endpoint() {
+        let relay = attestation_relay_open("attestation");
+        assert_eq!(
+            attestation_service_dial_target(),
+            ("127.0.0.1", 8006, None),
+            "ASR must be dialed from the supervisor namespace"
+        );
+        let endpoint = relay_target_endpoint(&relay).expect("attestation endpoint");
+        assert_eq!(endpoint.ip.as_deref(), Some(ATTESTATION_SERVICE_HOST));
+        assert_eq!(endpoint.port, Some(ATTESTATION_SERVICE_PORT));
+
+        let message = relay_target_message(&relay, "open", ssh_socket_path());
+        assert!(message.contains("attestation relay"));
+        assert!(message.contains("target=127.0.0.1:8006"));
     }
 
     #[test]

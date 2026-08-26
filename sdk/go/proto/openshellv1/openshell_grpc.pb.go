@@ -91,6 +91,7 @@ const (
 	OpenShell_AddWorkspaceMember_FullMethodName            = "/openshell.v1.OpenShell/AddWorkspaceMember"
 	OpenShell_RemoveWorkspaceMember_FullMethodName         = "/openshell.v1.OpenShell/RemoveWorkspaceMember"
 	OpenShell_ListWorkspaceMembers_FullMethodName          = "/openshell.v1.OpenShell/ListWorkspaceMembers"
+	OpenShell_GetSandboxAttestation_FullMethodName         = "/openshell.v1.OpenShell/GetSandboxAttestation"
 )
 
 // OpenShellClient is the client API for OpenShell service.
@@ -282,6 +283,9 @@ type OpenShellClient interface {
 	RemoveWorkspaceMember(ctx context.Context, in *RemoveWorkspaceMemberRequest, opts ...grpc.CallOption) (*RemoveWorkspaceMemberResponse, error)
 	// List members of a workspace.
 	ListWorkspaceMembers(ctx context.Context, in *ListWorkspaceMembersRequest, opts ...grpc.CallOption) (*ListWorkspaceMembersResponse, error)
+	// Appraise fresh evidence from a running sandbox for display. Kept at the
+	// end of the service to avoid renumbering existing generated methods.
+	GetSandboxAttestation(ctx context.Context, in *GetSandboxAttestationRequest, opts ...grpc.CallOption) (*GetSandboxAttestationResponse, error)
 }
 
 type openShellClient struct {
@@ -1005,6 +1009,16 @@ func (c *openShellClient) ListWorkspaceMembers(ctx context.Context, in *ListWork
 	return out, nil
 }
 
+func (c *openShellClient) GetSandboxAttestation(ctx context.Context, in *GetSandboxAttestationRequest, opts ...grpc.CallOption) (*GetSandboxAttestationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxAttestationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxAttestation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // OpenShellServer is the server API for OpenShell service.
 // All implementations must embed UnimplementedOpenShellServer
 // for forward compatibility.
@@ -1194,6 +1208,9 @@ type OpenShellServer interface {
 	RemoveWorkspaceMember(context.Context, *RemoveWorkspaceMemberRequest) (*RemoveWorkspaceMemberResponse, error)
 	// List members of a workspace.
 	ListWorkspaceMembers(context.Context, *ListWorkspaceMembersRequest) (*ListWorkspaceMembersResponse, error)
+	// Appraise fresh evidence from a running sandbox for display. Kept at the
+	// end of the service to avoid renumbering existing generated methods.
+	GetSandboxAttestation(context.Context, *GetSandboxAttestationRequest) (*GetSandboxAttestationResponse, error)
 	mustEmbedUnimplementedOpenShellServer()
 }
 
@@ -1407,6 +1424,9 @@ func (UnimplementedOpenShellServer) RemoveWorkspaceMember(context.Context, *Remo
 }
 func (UnimplementedOpenShellServer) ListWorkspaceMembers(context.Context, *ListWorkspaceMembersRequest) (*ListWorkspaceMembersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListWorkspaceMembers not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxAttestation(context.Context, *GetSandboxAttestationRequest) (*GetSandboxAttestationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxAttestation not implemented")
 }
 func (UnimplementedOpenShellServer) mustEmbedUnimplementedOpenShellServer() {}
 func (UnimplementedOpenShellServer) testEmbeddedByValue()                   {}
@@ -2584,6 +2604,24 @@ func _OpenShell_ListWorkspaceMembers_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_GetSandboxAttestation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxAttestationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxAttestation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxAttestation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxAttestation(ctx, req.(*GetSandboxAttestationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // OpenShell_ServiceDesc is the grpc.ServiceDesc for OpenShell service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2834,6 +2872,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListWorkspaceMembers",
 			Handler:    _OpenShell_ListWorkspaceMembers_Handler,
+		},
+		{
+			MethodName: "GetSandboxAttestation",
+			Handler:    _OpenShell_GetSandboxAttestation_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

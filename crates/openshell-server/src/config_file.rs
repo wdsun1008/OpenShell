@@ -134,6 +134,9 @@ pub struct GatewayFileSection {
     /// listener and reject user principals on that listener.
     #[serde(default)]
     pub exclusive_sandbox_callback: Option<bool>,
+    /// Optional display-only Trustee appraisal configuration.
+    #[serde(default)]
+    pub attestation_report: Option<AttestationReportFileConfig>,
 
     // ── Shared driver defaults (inherited into [openshell.drivers.<name>]) ─
     #[serde(default)]
@@ -191,6 +194,24 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+fn default_attestation_policy_id() -> String {
+    "default".to_string()
+}
+
+/// `[openshell.gateway.attestation_report]` settings.
+///
+/// These immutable inputs are used only for explicit, fresh display requests;
+/// they do not participate in readiness or key release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationReportFileConfig {
+    pub trustee_url: String,
+    pub reference_values_path: PathBuf,
+    pub as_public_key_path: PathBuf,
+    #[serde(default = "default_attestation_policy_id")]
+    pub policy_id: String,
 }
 
 /// `[openshell.gateway.otlp]` section.
@@ -635,6 +656,32 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn parses_display_only_attestation_config_with_default_policy() {
+        let toml = r#"
+[openshell.gateway]
+exclusive_sandbox_callback = true
+
+[openshell.gateway.attestation_report]
+trustee_url = "http://127.0.0.1:50005"
+reference_values_path = "/etc/openshell/attestation/references.json"
+as_public_key_path = "/etc/openshell/attestation/as-public.pem"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid attestation config parses");
+        let report = file
+            .openshell
+            .gateway
+            .attestation_report
+            .expect("attestation config");
+        assert_eq!(report.trustee_url, "http://127.0.0.1:50005");
+        assert_eq!(report.policy_id, "default");
+        assert_eq!(
+            report.reference_values_path,
+            PathBuf::from("/etc/openshell/attestation/references.json")
+        );
     }
 
     #[test]

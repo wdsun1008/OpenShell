@@ -101,8 +101,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-/// Draw the tab title for the sandbox bottom pane: Policy | Settings.
-pub fn draw_policy_tab_title(app: &App) -> Line<'_> {
+/// Draw the tab title for the sandbox bottom pane.
+pub fn draw_policy_tab_title(app: &App) -> Line<'static> {
     let t = &app.theme;
     let pol_style = if app.sandbox_policy_tab == SandboxPolicyTab::Policy {
         t.heading
@@ -114,11 +114,18 @@ pub fn draw_policy_tab_title(app: &App) -> Line<'_> {
     } else {
         t.muted
     };
+    let trust_style = if app.sandbox_policy_tab == SandboxPolicyTab::Trust {
+        t.heading
+    } else {
+        t.muted
+    };
 
     Line::from(vec![
         Span::styled(" Policy", pol_style),
         Span::styled(" | ", t.border),
-        Span::styled("Settings ", set_style),
+        Span::styled("Settings", set_style),
+        Span::styled(" | ", t.border),
+        Span::styled("Trust ", trust_style),
     ])
 }
 

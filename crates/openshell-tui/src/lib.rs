@@ -147,6 +147,10 @@ pub async fn run(
                     app.pending_sandbox_detail = false;
                     fetch_sandbox_detail(&mut app).await;
                 }
+                if app.pending_sandbox_attestation {
+                    app.pending_sandbox_attestation = false;
+                    spawn_sandbox_attestation(&app, events.sender());
+                }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
                     handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
@@ -296,6 +300,31 @@ pub async fn run(
                 }
                 fetch_sandbox_detail(&mut app).await;
             }
+            Some(Event::SandboxAttestationFetched {
+                request_id,
+                sandbox_name,
+                result,
+            }) => {
+                if request_id == app.sandbox_attestation_request_id {
+                    app.sandbox_attestation_loading = false;
+                    let still_selected = app.screen == Screen::Sandbox
+                        && app.sandbox_policy_tab == app::SandboxPolicyTab::Trust
+                        && app.selected_sandbox_name() == Some(sandbox_name.as_str());
+                    if still_selected {
+                        match result {
+                            Ok(appraisal) => {
+                                app.sandbox_attestation = Some(*appraisal);
+                                app.trust_scroll = 0;
+                                app.status_text = "fresh sandbox appraisal received".to_string();
+                            }
+                            Err(message) => {
+                                app.sandbox_attestation = None;
+                                app.status_text = format!("sandbox appraisal failed: {message}");
+                            }
+                        }
+                    }
+                }
+            }
             Some(Event::ForwardWarnings(warnings)) => {
                 app.status_text = format!("port forward issues: {}", warnings.join("; "));
             }
@@ -307,10 +336,18 @@ pub async fn run(
                     app.scroll_logs(3);
                 }
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxPolicy => {
-                    app.scroll_policy(-3);
+                    if app.sandbox_policy_tab == app::SandboxPolicyTab::Trust {
+                        app.scroll_trust(-3);
+                    } else {
+                        app.scroll_policy(-3);
+                    }
                 }
                 MouseEventKind::ScrollDown if app.focus == Focus::SandboxPolicy => {
-                    app.scroll_policy(3);
+                    if app.sandbox_policy_tab == app::SandboxPolicyTab::Trust {
+                        app.scroll_trust(3);
+                    } else {
+                        app.scroll_policy(3);
+                    }
                 }
                 _ => {}
             },
@@ -849,6 +886,36 @@ async fn fetch_sandbox_detail(app: &mut App) {
     }
 
     app.policy_scroll = 0;
+}
+
+fn spawn_sandbox_attestation(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(sandbox_name) = app.selected_sandbox_name().map(str::to_string) else {
+        return;
+    };
+    let request_id = app.sandbox_attestation_request_id;
+    let workspace = app.selected_sandbox_workspace();
+    let mut client = app.client.clone();
+    tokio::spawn(async move {
+        let request = openshell_core::proto::GetSandboxAttestationRequest {
+            name: sandbox_name.clone(),
+            workspace,
+        };
+        let result = match tokio::time::timeout(
+            Duration::from_secs(50),
+            client.get_sandbox_attestation(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(Box::new(response.into_inner())),
+            Ok(Err(error)) => Err(error.message().to_string()),
+            Err(_) => Err("request timed out".to_string()),
+        };
+        let _ = tx.send(Event::SandboxAttestationFetched {
+            request_id,
+            sandbox_name,
+            result,
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

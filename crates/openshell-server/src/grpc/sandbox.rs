@@ -20,7 +20,8 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
-    ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
+    ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    GetSandboxAttestationRequest, GetSandboxAttestationResponse, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
     SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
@@ -391,31 +392,71 @@ pub(super) async fn handle_get_sandbox(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.name.is_empty() {
+    let sandbox =
+        fetch_and_authorize_sandbox_by_name(state, &principal, &req.name, &req.workspace).await?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+    }))
+}
+
+pub(super) async fn handle_get_sandbox_attestation(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxAttestationRequest>,
+) -> Result<Response<GetSandboxAttestationResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let sandbox =
+        fetch_and_authorize_sandbox_by_name(state, &principal, &req.name, &req.workspace).await?;
+    let reporter = state
+        .attestation_reporter
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox attestation is not configured"))?;
+
+    let appraisal = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        reporter.collect(&state.supervisor_sessions, sandbox.object_id()),
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("sandbox attestation timed out"))?
+    .map_err(|error| match error {
+        crate::attestation_report::AppraisalError::RelayUnavailable
+        | crate::attestation_report::AppraisalError::EvidenceCollection
+        | crate::attestation_report::AppraisalError::TrusteeRequest => {
+            Status::unavailable("sandbox appraisal is temporarily unavailable")
+        }
+        crate::attestation_report::AppraisalError::InvalidAppraisal => {
+            Status::failed_precondition("sandbox appraisal could not be verified")
+        }
+    })?;
+    Ok(Response::new(appraisal))
+}
+
+async fn fetch_and_authorize_sandbox_by_name(
+    state: &Arc<ServerState>,
+    principal: &crate::auth::principal::Principal,
+    name: &str,
+    workspace: &str,
+) -> Result<Sandbox, Status> {
+    if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
-        &principal,
-        &req.workspace,
+        principal,
+        workspace,
         MinWorkspaceRole::User,
     )
     .await?;
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-
-    let sandbox = state
+    state
         .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
+        .get_message_by_name::<Sandbox>(&workspace, name)
         .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-
-    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
-    Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
-    }))
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 pub(super) async fn handle_list_sandboxes(
@@ -2672,6 +2713,9 @@ mod tests {
         match validate_tcp_forward_init(&init).expect("ssh target should pass") {
             relay_open::Target::Ssh(_) => {}
             other @ relay_open::Target::Tcp(_) => panic!("expected SSH target, got {other:?}"),
+            relay_open::Target::AttestationService(_) => {
+                panic!("client TCP forwarding must not create an attestation target")
+            }
         }
     }
 
@@ -2770,6 +2814,31 @@ mod tests {
                 "fallback name should be all lowercase: {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_attestation_requires_name_and_explicit_gateway_configuration() {
+        let state = test_server_state().await;
+        let missing_name = handle_get_sandbox_attestation(
+            &state,
+            authed_request(GetSandboxAttestationRequest::default()),
+        )
+        .await
+        .expect_err("name is required");
+        assert_eq!(missing_name.code(), tonic::Code::InvalidArgument);
+
+        let sandbox = test_sandbox("attested", Vec::new());
+        state.store.put_message(&sandbox).await.expect("sandbox");
+        let unconfigured = handle_get_sandbox_attestation(
+            &state,
+            authed_request(GetSandboxAttestationRequest {
+                name: "attested".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("appraisal remains opt-in");
+        assert_eq!(unconfigured.code(), tonic::Code::FailedPrecondition);
     }
 
     fn test_provider(name: &str, provider_type: &str) -> Provider {

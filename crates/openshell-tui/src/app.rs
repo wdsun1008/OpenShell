@@ -149,13 +149,15 @@ pub struct SettingEditState {
 pub enum SandboxPolicyTab {
     Policy,
     Settings,
+    Trust,
 }
 
 impl SandboxPolicyTab {
     pub fn next(self) -> Self {
         match self {
             Self::Policy => Self::Settings,
-            Self::Settings => Self::Policy,
+            Self::Settings => Self::Trust,
+            Self::Trust => Self::Policy,
         }
     }
 }
@@ -653,6 +655,13 @@ pub struct App {
     pub pending_sandbox_delete: bool,
     pub pending_sandbox_detail: bool,
     pub pending_shell_connect: bool,
+    pub pending_sandbox_attestation: bool,
+    pub sandbox_attestation_loading: bool,
+    pub sandbox_attestation_request_id: u64,
+    pub sandbox_attestation: Option<openshell_core::proto::GetSandboxAttestationResponse>,
+    pub trust_scroll: usize,
+    pub trust_content_rows: usize,
+    pub trust_viewport_height: usize,
 
     // Sandbox policy pane tab + sandbox settings
     pub sandbox_policy_tab: SandboxPolicyTab,
@@ -1004,6 +1013,13 @@ impl App {
             pending_sandbox_delete: false,
             pending_sandbox_detail: false,
             pending_shell_connect: false,
+            pending_sandbox_attestation: false,
+            sandbox_attestation_loading: false,
+            sandbox_attestation_request_id: 0,
+            sandbox_attestation: None,
+            trust_scroll: 0,
+            trust_content_rows: 0,
+            trust_viewport_height: 0,
             sandbox_policy_tab: SandboxPolicyTab::Policy,
             sandbox_policy_is_global: false,
             sandbox_global_policy_version: 0,
@@ -1621,6 +1637,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.sandbox_count > 0 => {
+                self.clear_sandbox_attestation();
                 self.screen = Screen::Sandbox;
                 self.focus = Focus::SandboxPolicy;
                 self.confirm_delete = false;
@@ -1648,14 +1665,21 @@ impl App {
             return;
         }
 
-        // Dispatch to sandbox settings handler when on the Settings tab.
-        if self.sandbox_policy_tab == SandboxPolicyTab::Settings {
-            self.handle_sandbox_settings_key(key);
-            return;
+        match self.sandbox_policy_tab {
+            SandboxPolicyTab::Settings => {
+                self.handle_sandbox_settings_key(key);
+                return;
+            }
+            SandboxPolicyTab::Trust => {
+                self.handle_sandbox_trust_key(key);
+                return;
+            }
+            SandboxPolicyTab::Policy => {}
         }
 
         match key.code {
             KeyCode::Esc => {
+                self.clear_sandbox_attestation();
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
                 self.draft_detail_scroll = 0;
@@ -1719,6 +1743,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Esc => {
+                self.clear_sandbox_attestation();
                 self.cancel_log_stream();
                 self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
@@ -1787,6 +1812,57 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_sandbox_trust_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Esc => {
+                self.clear_sandbox_attestation();
+                self.cancel_log_stream();
+                self.sandbox_policy_tab = SandboxPolicyTab::Policy;
+                self.screen = Screen::Dashboard;
+                self.focus = Focus::Sandboxes;
+            }
+            KeyCode::Char('r') if !self.sandbox_attestation_loading => {
+                self.sandbox_attestation = None;
+                self.trust_scroll = 0;
+                self.sandbox_attestation_loading = true;
+                self.pending_sandbox_attestation = true;
+                self.status_text = "requesting fresh sandbox appraisal...".to_string();
+            }
+            KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
+                self.clear_sandbox_attestation();
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_trust(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_trust(-1),
+            KeyCode::PageDown => {
+                let delta = self.trust_viewport_height.max(1).cast_signed();
+                self.scroll_trust(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = self.trust_viewport_height.max(1).cast_signed();
+                self.scroll_trust(-delta);
+            }
+            KeyCode::Char('G') => {
+                self.trust_scroll = self
+                    .trust_content_rows
+                    .saturating_sub(self.trust_viewport_height.max(1));
+            }
+            KeyCode::Char('g') => self.trust_scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn clear_sandbox_attestation(&mut self) {
+        self.sandbox_attestation_request_id = self.sandbox_attestation_request_id.wrapping_add(1);
+        self.pending_sandbox_attestation = false;
+        self.sandbox_attestation_loading = false;
+        self.sandbox_attestation = None;
+        self.trust_scroll = 0;
+        self.trust_content_rows = 0;
+        self.trust_viewport_height = 0;
     }
 
     fn handle_sandbox_setting_edit_key(&mut self, key: KeyEvent) {
@@ -2097,6 +2173,15 @@ impl App {
             delta,
             self.policy_lines.len(),
             self.policy_viewport_height,
+        );
+    }
+
+    pub fn scroll_trust(&mut self, delta: isize) {
+        self.trust_scroll = clamped_scroll(
+            self.trust_scroll,
+            delta,
+            self.trust_content_rows,
+            self.trust_viewport_height,
         );
     }
 
@@ -3425,6 +3510,7 @@ impl App {
         self.sandbox_providers_list.clear();
         self.policy_lines.clear();
         self.policy_scroll = 0;
+        self.clear_sandbox_attestation();
         // Platform-admin capabilities are gateway-specific. Probe them again after
         // switching gateways and never retain privileged state from the old one.
         self.global_settings_access_denied = false;
@@ -3499,6 +3585,58 @@ mod tests {
             "default".to_string(),
             crate::theme::Theme::dark(),
         )
+    }
+
+    #[test]
+    fn sandbox_tabs_cycle_through_trust() {
+        assert_eq!(SandboxPolicyTab::Policy.next(), SandboxPolicyTab::Settings);
+        assert_eq!(SandboxPolicyTab::Settings.next(), SandboxPolicyTab::Trust);
+        assert_eq!(SandboxPolicyTab::Trust.next(), SandboxPolicyTab::Policy);
+    }
+
+    #[tokio::test]
+    async fn trust_refresh_is_explicit_and_leaving_invalidates_transient_state() {
+        let mut app = test_app();
+        app.screen = Screen::Sandbox;
+        app.focus = Focus::SandboxPolicy;
+        app.sandbox_policy_tab = SandboxPolicyTab::Trust;
+        app.sandbox_names.push("demo".to_string());
+        app.sandbox_count = 1;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.pending_sandbox_attestation);
+        assert!(app.sandbox_attestation_loading);
+
+        let request_id = app.sandbox_attestation_request_id;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.sandbox_policy_tab, SandboxPolicyTab::Policy);
+        assert!(!app.pending_sandbox_attestation);
+        assert!(!app.sandbox_attestation_loading);
+        assert!(app.sandbox_attestation.is_none());
+        assert_ne!(app.sandbox_attestation_request_id, request_id);
+    }
+
+    #[tokio::test]
+    async fn trust_scroll_uses_rendered_rows_and_resets_on_refresh() {
+        let mut app = test_app();
+        app.screen = Screen::Sandbox;
+        app.focus = Focus::SandboxPolicy;
+        app.sandbox_policy_tab = SandboxPolicyTab::Trust;
+        app.trust_content_rows = 100;
+        app.trust_viewport_height = 10;
+
+        app.handle_sandbox_trust_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.trust_scroll, 10);
+        app.handle_sandbox_trust_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(app.trust_scroll, 90);
+        app.handle_sandbox_trust_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.trust_scroll, 90);
+        app.handle_sandbox_trust_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.trust_scroll, 0);
+
+        app.trust_scroll = 25;
+        app.handle_sandbox_trust_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.trust_scroll, 0);
     }
 
     #[tokio::test]

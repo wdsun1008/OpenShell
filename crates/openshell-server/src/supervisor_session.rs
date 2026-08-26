@@ -217,6 +217,14 @@ impl SupervisorSessionRegistry {
             .is_some_and(|session| session.session_id == session_id)
     }
 
+    pub fn current_session_id(&self, sandbox_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .map(|session| session.session_id.clone())
+    }
+
     fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {
         self.pending_relays
             .lock()
@@ -1046,6 +1054,11 @@ mod tests {
             tx,
             make_shutdown(),
         ));
+        assert_eq!(
+            registry.current_session_id("sandbox-1").as_deref(),
+            Some("s1")
+        );
+        assert!(registry.is_current_session("sandbox-1", "s1"));
 
         let sessions = registry.sessions.lock().unwrap();
         assert!(sessions.contains_key("sandbox-1"));
@@ -1155,6 +1168,35 @@ mod tests {
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_relay_delivers_internal_attestation_target() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+
+        registry
+            .open_relay_with_target(
+                "sbx",
+                relay_open::Target::AttestationService(
+                    openshell_core::proto::AttestationServiceRelayTarget {},
+                ),
+                "attestation-report".to_string(),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("internal attestation relay");
+
+        let msg = rx.recv().await.expect("relay open should be delivered");
+        let Some(gateway_message::Payload::RelayOpen(open)) = msg.payload else {
+            panic!("expected RelayOpen");
+        };
+        assert!(matches!(
+            open.target,
+            Some(relay_open::Target::AttestationService(_))
+        ));
+        assert_eq!(open.service_id, "attestation-report");
     }
 
     #[tokio::test]

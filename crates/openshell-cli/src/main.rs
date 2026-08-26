@@ -1500,6 +1500,18 @@ enum SandboxCommands {
         output: OutputFormat,
     },
 
+    /// Request a fresh Trustee appraisal for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Attest {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
     /// List sandboxes.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
@@ -3170,6 +3182,17 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
+                        SandboxCommands::Attest { name, output } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_attest(
+                                endpoint,
+                                &name,
+                                output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
+                        }
                         SandboxCommands::List {
                             limit,
                             offset,
@@ -4519,6 +4542,34 @@ mod tests {
                 command: Some(SandboxCommands::List {
                     output: OutputFormat::Table,
                     ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_attest_accepts_optional_name_and_structured_output() {
+        let named =
+            Cli::try_parse_from(["openshell", "sandbox", "attest", "demo", "--output", "json"])
+                .expect("sandbox attest should parse");
+        assert!(matches!(
+            named.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Attest {
+                    name: Some(ref name),
+                    output: OutputFormat::Json,
+                })
+            }) if name == "demo"
+        ));
+
+        let defaulted = Cli::try_parse_from(["openshell", "sandbox", "attest"])
+            .expect("sandbox attest without name should parse");
+        assert!(matches!(
+            defaulted.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Attest {
+                    name: None,
+                    output: OutputFormat::Table,
                 })
             })
         ));

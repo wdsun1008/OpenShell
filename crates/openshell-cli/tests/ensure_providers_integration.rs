@@ -140,6 +140,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse::default()))
     }
 
+    async fn get_sandbox_attestation(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSandboxAttestationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAttestationResponse>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
     async fn list_sandboxes(
         &self,
         _request: tonic::Request<ListSandboxesRequest>,

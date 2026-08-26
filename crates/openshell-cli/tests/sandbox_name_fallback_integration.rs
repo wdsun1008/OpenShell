@@ -124,6 +124,29 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_sandbox_attestation(
+        &self,
+        request: tonic::Request<openshell_core::proto::GetSandboxAttestationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAttestationResponse>, Status> {
+        let request = request.into_inner();
+        assert_eq!(request.name, "fallback-sandbox");
+        Ok(Response::new(
+            openshell_core::proto::GetSandboxAttestationResponse {
+                ear_status: "affirming".to_string(),
+                policy_id: "test".to_string(),
+                ar4si_vector: Some(
+                    openshell_core::proto::SandboxAttestationTrustworthinessVector {
+                        hardware: 2,
+                        executables: 3,
+                        configuration: 2,
+                        file_system: 2,
+                    },
+                ),
+                measurements: vec![],
+            },
+        ))
+    }
+
     async fn list_sandboxes(
         &self,
         _request: tonic::Request<ListSandboxesRequest>,
@@ -740,6 +763,14 @@ async fn sandbox_get_sends_correct_name() {
         Some("my-sandbox"),
         "mock should have recorded the requested sandbox name"
     );
+}
+
+#[tokio::test]
+async fn sandbox_attest_uses_the_fresh_dedicated_rpc() {
+    let ts = run_server().await;
+    run::sandbox_attest(&ts.endpoint, "fallback-sandbox", "json", "default", &ts.tls)
+        .await
+        .expect("sandbox_attest should succeed");
 }
 
 /// `sandbox_get` with `policy_only` calls `GetSandboxConfig` and prints YAML from the response.

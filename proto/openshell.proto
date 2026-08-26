@@ -680,6 +680,17 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+
+  // Appraise fresh evidence from a running sandbox for display. Kept at the
+  // end of the service to avoid renumbering existing generated methods.
+  rpc GetSandboxAttestation(GetSandboxAttestationRequest)
+      returns (GetSandboxAttestationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the
@@ -2251,9 +2262,12 @@ message RelayOpen {
   string channel_id = 1;
   // Target the supervisor should dial inside the sandbox.
   // If absent, supervisors treat the relay as SSH for compatibility.
+  // The attestation-service target is gateway-internal and is not exposed by
+  // the client-facing TcpForwardInit API.
   oneof target {
     SshRelayTarget ssh = 2;
     TcpRelayTarget tcp = 3;
+    AttestationServiceRelayTarget attestation_service = 4;
   }
   // Optional service identifier for audit/correlation.
   string service_id = 5;
@@ -2269,6 +2283,10 @@ message TcpRelayTarget {
   // Target port. Must fit in u16 and be non-zero.
   uint32 port = 2;
 }
+
+// Built-in attestation-service target. The supervisor resolves this fieldless
+// target to the fixed ASR loopback endpoint in its own network namespace.
+message AttestationServiceRelayTarget {}
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.
 message RelayInit {
@@ -2881,4 +2899,40 @@ message ExtensionServiceCredential {
   string token = 2 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the token, milliseconds since the epoch.
   int64 expires_at_ms = 3;
+}
+
+// Request a fresh, display-only Trustee appraisal for one sandbox. Kept at
+// the end of the file to avoid renumbering existing generated descriptors.
+message GetSandboxAttestationRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Signed Trustee appraisal reduced to the fields displayed by OpenShell.
+// Raw evidence, EAR tokens, nonces, session details, and diagnostic messages
+// are never returned by this API.
+message GetSandboxAttestationResponse {
+  string ear_status = 1;
+  string policy_id = 2;
+  SandboxAttestationTrustworthinessVector ar4si_vector = 3;
+  repeated SandboxAttestationMeasurement measurements = 4;
+}
+
+// AR4SI trustworthiness vector returned by Trustee.
+message SandboxAttestationTrustworthinessVector {
+  int32 hardware = 1;
+  int32 executables = 2;
+  int32 configuration = 3;
+  int32 file_system = 4;
+}
+
+// One measured boot component and the Gateway-configured reference values.
+message SandboxAttestationMeasurement {
+  // Stable component name: shim, grub, kernel, initrd, or kernel_cmdline.
+  string component = 1;
+  string algorithm = 2;
+  string measurement = 3;
+  repeated string references = 4;
 }

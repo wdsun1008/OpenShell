@@ -51,6 +51,12 @@ pub enum Event {
     SandboxSettingSetResult(Result<u64, String>),
     /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
     SandboxSettingDeleteResult(Result<u64, String>),
+    /// Result of one explicit, fresh sandbox appraisal request.
+    SandboxAttestationFetched {
+        request_id: u64,
+        sandbox_name: String,
+        result: Result<Box<openshell_core::proto::GetSandboxAttestationResponse>, String>,
+    },
     /// Non-fatal warnings from port-forward setup after sandbox creation.
     ForwardWarnings(Vec<String>),
 }

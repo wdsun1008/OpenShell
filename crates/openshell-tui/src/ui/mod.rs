@@ -11,6 +11,7 @@ mod sandbox_draft;
 pub mod sandbox_logs;
 mod sandbox_policy;
 pub mod sandbox_settings;
+mod sandbox_trust;
 pub mod sandboxes;
 mod splash;
 
@@ -86,6 +87,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
         _ => match app.sandbox_policy_tab {
             app::SandboxPolicyTab::Settings => sandbox_settings::draw(frame, app, chunks[1]),
+            app::SandboxPolicyTab::Trust => sandbox_trust::draw(frame, app, chunks[1]),
             app::SandboxPolicyTab::Policy => sandbox_policy::draw(frame, app, chunks[1]),
         },
     }
@@ -426,6 +428,23 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ]);
                 spans
             }
+            _ if app.sandbox_policy_tab == app::SandboxPolicyTab::Trust => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[r]", t.key_hint),
+                Span::styled(" Refresh", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Scroll", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             _ if app.sandbox_policy_tab == app::SandboxPolicyTab::Settings => vec![
                 Span::styled(" ", t.text),
                 Span::styled("[h/l]", t.key_hint),

@@ -164,6 +164,14 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
+# Optional display-only appraisal. Uncomment this table and set
+# exclusive_sandbox_callback = true in [openshell.gateway].
+# [openshell.gateway.attestation_report]
+# trustee_url           = "http://127.0.0.1:50005"
+# reference_values_path = "/etc/openshell/attestation/reference-values.json"
+# as_public_key_path    = "/etc/openshell/attestation/as-public.pem"
+# policy_id             = "peerpod"
+
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
@@ -204,6 +212,8 @@ allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments normally use OIDC or a trusted access proxy. A Kubernetes deployment may combine mTLS user authentication with `exclusive_sandbox_callback = true` only when its compute driver requests a distinct callback listener: the callback listener accepts sandbox principals and sandbox-callable RPCs only, while the primary listener rejects sandbox principals. Startup fails if the requested address is covered by the primary listener instead of being bound separately. The option is disabled by default and the Helm chart does not enable it.
+
+`[openshell.gateway.attestation_report]` enables the explicit `openshell sandbox attest` request. The gateway obtains fresh evidence through the sandbox's existing supervisor session, asks the loopback Trustee endpoint to appraise it, verifies the signed EAR, nonce, expiry, and selected policy, and returns only the EAR status, policy ID, AR4SI vector, measurements, and configured references. It does not persist appraisals or use them for readiness or key release. `trustee_url` must use a loopback HTTP(S) address, and this table requires `exclusive_sandbox_callback = true` so sandbox principals cannot share the primary user listener.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 

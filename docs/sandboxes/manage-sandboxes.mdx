@@ -364,6 +364,21 @@ Print only that policy YAML for scripting (same effective policy, no metadata):
 openshell sandbox get my-sandbox --policy-only
 ```
 
+When the gateway is configured for confidential sandbox appraisal, request a
+fresh Trustee result explicitly:
+
+```shell
+openshell sandbox attest my-sandbox
+openshell sandbox attest my-sandbox --output json
+```
+
+The command shows only the EAR status, policy ID, AR4SI vector, and the
+measurement/reference pairs for boot components. It does not reuse a cached
+result. In `openshell term`, open the sandbox, select the **Trust** tab, and
+press **r** to make the same fresh request. Leaving the tab discards the
+displayed result. This view is informational; Trustee/KBS key release remains
+the enforcement path.
+
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 
 ```shell
