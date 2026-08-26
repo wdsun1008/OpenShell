@@ -4,7 +4,7 @@
 use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -15,7 +15,7 @@ use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
     KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    TngSidecarConfig, WorkspaceAccessMode, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -39,6 +39,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
     workspace_mode: WorkspaceMode,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_WORKSPACE_ACCESS_MODE",
+        default_value = "ReadWriteOnce"
+    )]
+    workspace_access_mode: WorkspaceAccessMode,
 
     #[arg(
         long,
@@ -76,6 +83,14 @@ struct Args {
     )]
     sandbox_image_pull_secrets: Vec<String>,
 
+    /// Operator-owned Pod annotations applied after sandbox-authored values.
+    #[arg(
+        long = "operator-pod-annotation",
+        env = "OPENSHELL_K8S_OPERATOR_POD_ANNOTATIONS",
+        value_delimiter = ','
+    )]
+    operator_pod_annotations: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
 
@@ -101,6 +116,28 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
+
+    /// Enable the attested TNG sidecar for a pinned confidential runtime.
+    #[arg(long, env = "OPENSHELL_K8S_TNG_ENABLED", action = ArgAction::Set)]
+    tng_enabled: bool,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_IMAGE")]
+    tng_image: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_IMAGE_PULL_POLICY")]
+    tng_image_pull_policy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_LISTEN_PORT", default_value_t = 17_670)]
+    tng_listen_port: u16,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_VERIFIER_ADDRESS")]
+    tng_verifier_address: Option<IpAddr>,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_VERIFIER_PORT", default_value_t = 9_443)]
+    tng_verifier_port: u16,
+
+    #[arg(long, env = "OPENSHELL_K8S_TNG_CALLBACK_BIND_ADDRESS")]
+    tng_callback_bind_address: Option<SocketAddr>,
 
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
@@ -184,6 +221,26 @@ struct Args {
     sandbox_gid: Option<u32>,
 }
 
+fn parse_operator_annotations(entries: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for entry in entries {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            miette::miette!("operator Pod annotation must use key=value: {entry}")
+        })?;
+        if key.is_empty() {
+            return Err(miette::miette!(
+                "operator Pod annotation key must not be empty"
+            ));
+        }
+        if values.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(miette::miette!(
+                "duplicate operator Pod annotation key: {key}"
+            ));
+        }
+    }
+    Ok(values)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -228,6 +285,7 @@ async fn main() -> Result<()> {
                 })
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let operator_pod_annotations = parse_operator_annotations(&args.operator_pod_annotations)?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
@@ -241,6 +299,7 @@ async fn main() -> Result<()> {
             default_image: args.sandbox_image.unwrap_or_default(),
             image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
             image_pull_secrets: args.sandbox_image_pull_secrets,
+            pod_annotations: operator_pod_annotations,
             managed_ssh_ingress: ManagedSshIngressConfig {
                 enabled: args.managed_ssh_ingress_enabled,
                 gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
@@ -277,6 +336,7 @@ async fn main() -> Result<()> {
             }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
+            workspace_access_mode: args.workspace_access_mode,
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
             sa_token_ttl_secs: args.sa_token_ttl_secs,
@@ -285,6 +345,15 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            tng: TngSidecarConfig {
+                enabled: args.tng_enabled,
+                image: args.tng_image.unwrap_or_default(),
+                image_pull_policy: args.tng_image_pull_policy.unwrap_or_default(),
+                listen_port: args.tng_listen_port,
+                verifier_address: args.tng_verifier_address,
+                verifier_port: args.tng_verifier_port,
+                callback_bind_address: args.tng_callback_bind_address,
+            },
         },
         shutdown_rx,
     )
@@ -317,5 +386,51 @@ async fn main() -> Result<()> {
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_operator_owned_confidential_runtime_flags() {
+        let args = Args::try_parse_from([
+            "openshell-driver-kubernetes",
+            "--workspace-access-mode",
+            "ReadWriteOncePod",
+            "--operator-pod-annotation",
+            "example.com/trusted=true",
+            "--tng-enabled",
+            "true",
+            "--tng-image",
+            &format!("example.com/tng@sha256:{}", "ab".repeat(32)),
+            "--tng-verifier-address",
+            "10.0.0.8",
+            "--tng-callback-bind-address",
+            "127.0.0.2:17670",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.workspace_access_mode,
+            WorkspaceAccessMode::ReadWriteOncePod
+        );
+        assert!(args.tng_enabled);
+        assert_eq!(args.tng_verifier_address, Some("10.0.0.8".parse().unwrap()));
+        assert_eq!(
+            parse_operator_annotations(&args.operator_pod_annotations).unwrap()["example.com/trusted"],
+            "true"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_operator_owned_assignments() {
+        let error = parse_operator_annotations(&[
+            "example.com/key=one".to_string(),
+            "example.com/key=two".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
     }
 }

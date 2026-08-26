@@ -7,12 +7,13 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -48,8 +49,19 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        let requirements = self
+            .driver
+            .gateway_callback_bind_address()
+            .map(|address| GatewayListenerRequirement {
+                reason: "attested Kubernetes sandbox callback".to_string(),
+                selector: Some(gateway_listener_requirement::Selector::ExactBindAddress(
+                    address.to_string(),
+                )),
+            })
+            .into_iter()
+            .collect();
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements: Vec::new(),
+            requirements,
         }))
     }
 

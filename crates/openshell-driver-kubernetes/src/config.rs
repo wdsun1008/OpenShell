@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -21,6 +22,115 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
+
+/// Access mode for the driver-managed workspace PVC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WorkspaceAccessMode {
+    #[default]
+    #[serde(rename = "ReadWriteOnce")]
+    ReadWriteOnce,
+    #[serde(rename = "ReadWriteOncePod")]
+    ReadWriteOncePod,
+}
+
+impl WorkspaceAccessMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWriteOnce => "ReadWriteOnce",
+            Self::ReadWriteOncePod => "ReadWriteOncePod",
+        }
+    }
+}
+
+impl FromStr for WorkspaceAccessMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ReadWriteOnce" => Ok(Self::ReadWriteOnce),
+            "ReadWriteOncePod" => Ok(Self::ReadWriteOncePod),
+            other => Err(format!(
+                "unknown workspace access mode '{other}'; expected 'ReadWriteOnce' or 'ReadWriteOncePod'"
+            )),
+        }
+    }
+}
+
+/// Optional TNG sidecar that terminates the sandbox's attested gateway path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TngSidecarConfig {
+    pub enabled: bool,
+    pub image: String,
+    pub image_pull_policy: String,
+    pub listen_port: u16,
+    pub verifier_address: Option<IpAddr>,
+    pub verifier_port: u16,
+    /// Trusted-host gateway address reached after verifier-side attestation.
+    pub callback_bind_address: Option<SocketAddr>,
+}
+
+impl Default for TngSidecarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: String::new(),
+            image_pull_policy: String::new(),
+            listen_port: 17_670,
+            verifier_address: None,
+            verifier_port: 9_443,
+            callback_bind_address: None,
+        }
+    }
+}
+
+impl TngSidecarConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.image.trim().is_empty() {
+            return Err("tng.image is required when tng.enabled is true".to_string());
+        }
+        if !is_sha256_pinned_image(&self.image) {
+            return Err(
+                "tng.image must be pinned by an OCI sha256 digest when tng.enabled is true"
+                    .to_string(),
+            );
+        }
+        if self.listen_port == 0 || self.verifier_port == 0 {
+            return Err("tng listen and verifier ports must be greater than zero".to_string());
+        }
+        let Some(IpAddr::V4(verifier)) = self.verifier_address else {
+            return Err("tng.verifier_address must be a private IPv4 address".to_string());
+        };
+        if !verifier.is_private() {
+            return Err("tng.verifier_address must be a private IPv4 address".to_string());
+        }
+        let Some(callback) = self.callback_bind_address else {
+            return Err("tng.callback_bind_address is required".to_string());
+        };
+        if !callback.ip().is_loopback() || callback.port() != self.listen_port {
+            return Err(format!(
+                "tng.callback_bind_address must be loopback port {}",
+                self.listen_port
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_pinned_image(image: &str) -> bool {
+    let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
@@ -309,6 +419,8 @@ pub struct KubernetesComputeConfig {
     pub image_pull_policy: String,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
     pub image_pull_secrets: Vec<String>,
+    /// Operator-owned annotations applied after sandbox-authored annotations.
+    pub pod_annotations: BTreeMap<String, String>,
     /// Managed-mode SSH ingress isolation. When enabled, the driver creates a
     /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
     /// only from gateway pods matching this peer.
@@ -365,6 +477,8 @@ pub struct KubernetesComputeConfig {
     /// `StorageClass`, otherwise the workspace PVC stays `Pending` and the
     /// sandbox never starts.
     pub workspace_storage_class: String,
+    /// Kubernetes access mode used by the default workspace PVC.
+    pub workspace_access_mode: WorkspaceAccessMode,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -399,6 +513,8 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Attested TNG transport for confidential Kubernetes runtimes.
+    pub tng: TngSidecarConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -445,6 +561,7 @@ impl Default for KubernetesComputeConfig {
             // is Podman vocabulary and is not a valid Kubernetes value.
             image_pull_policy: String::new(),
             image_pull_secrets: Vec::new(),
+            pod_annotations: BTreeMap::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
@@ -465,11 +582,13 @@ impl Default for KubernetesComputeConfig {
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
+            workspace_access_mode: WorkspaceAccessMode::default(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            tng: TngSidecarConfig::default(),
         }
     }
 }
@@ -504,6 +623,28 @@ impl KubernetesComputeConfig {
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
         self.sidecar.validate_proxy_uid()
+    }
+
+    pub fn validate_confidential_runtime(&self) -> Result<(), String> {
+        self.tng.validate()?;
+        if !self.tng.enabled {
+            return Ok(());
+        }
+        if self.default_runtime_class_name.trim().is_empty() {
+            return Err(
+                "default_runtime_class_name is required when tng.enabled is true".to_string(),
+            );
+        }
+        let expected = format!("https://127.0.0.1:{}", self.tng.listen_port);
+        if self.grpc_endpoint != expected {
+            return Err(format!(
+                "grpc_endpoint must be {expected} when tng.enabled is true"
+            ));
+        }
+        if self.client_tls_secret_name.trim().is_empty() {
+            return Err("client_tls_secret_name is required when tng.enabled is true".to_string());
+        }
+        Ok(())
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
@@ -1865,5 +2006,68 @@ mod tests {
         assert!(al.insert("ns2".to_string()));
         assert!(al.read().contains("ns2"));
         assert!(al.remove("ns1"));
+    }
+
+    #[test]
+    fn confidential_runtime_defaults_are_disabled_and_upstream_compatible() {
+        let cfg = KubernetesComputeConfig::default();
+
+        assert!(!cfg.tng.enabled);
+        assert_eq!(
+            cfg.workspace_access_mode,
+            WorkspaceAccessMode::ReadWriteOnce
+        );
+        assert!(cfg.pod_annotations.is_empty());
+        cfg.validate_confidential_runtime().unwrap();
+    }
+
+    #[test]
+    fn confidential_runtime_requires_a_complete_pinned_transport() {
+        let mut cfg = KubernetesComputeConfig {
+            grpc_endpoint: "https://127.0.0.1:17670".to_string(),
+            client_tls_secret_name: "openshell-client-tls".to_string(),
+            default_runtime_class_name: "kata-remote".to_string(),
+            tng: TngSidecarConfig {
+                enabled: true,
+                image: format!("example.com/tng@sha256:{}", "ab".repeat(32)),
+                verifier_address: Some("10.0.0.8".parse().unwrap()),
+                callback_bind_address: Some("127.0.0.2:17670".parse().unwrap()),
+                ..TngSidecarConfig::default()
+            },
+            ..KubernetesComputeConfig::default()
+        };
+
+        cfg.validate_confidential_runtime().unwrap();
+
+        cfg.grpc_endpoint = "https://10.0.0.9:17670".to_string();
+        assert!(
+            cfg.validate_confidential_runtime()
+                .unwrap_err()
+                .contains("127.0.0.1")
+        );
+        cfg.grpc_endpoint = "https://127.0.0.1:17670".to_string();
+
+        cfg.tng.image = "example.com/tng:latest".to_string();
+        assert!(
+            cfg.validate_confidential_runtime()
+                .unwrap_err()
+                .contains("sha256")
+        );
+        cfg.tng.image = format!("example.com/tng@sha256:{}", "ab".repeat(32));
+
+        cfg.tng.verifier_address = Some("8.8.8.8".parse().unwrap());
+        assert!(
+            cfg.validate_confidential_runtime()
+                .unwrap_err()
+                .contains("private IPv4")
+        );
+        cfg.tng.verifier_address = Some("10.0.0.8".parse().unwrap());
+
+        cfg.tng.callback_bind_address = Some("0.0.0.0:17670".parse().unwrap());
+        assert!(
+            cfg.validate_confidential_runtime()
+                .unwrap_err()
+                .contains("loopback")
+        );
     }
 }

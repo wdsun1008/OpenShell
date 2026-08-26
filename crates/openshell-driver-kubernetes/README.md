@@ -32,7 +32,7 @@ not a tenant isolation boundary.
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to
-this driver. Kubernetes owns scheduling and pod lifecycle. The
+this driver over the compute-driver API. Kubernetes owns scheduling and pod lifecycle. The
 `openshell-sandbox` supervisor inside each workload owns agent isolation,
 credential injection, policy polling, logs, and the gateway relay.
 
@@ -92,6 +92,56 @@ bootstrap exchange.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
+
+## Opt-in Confidential Runtime Transport
+
+The standalone driver can add one concrete TNG native sidecar for a pinned
+confidential Kubernetes runtime. This path is disabled by default and does not
+change ordinary Kubernetes sandbox rendering. When enabled, startup fails
+unless all of the following operator-owned settings agree:
+
+- `OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME` pins the confidential
+  `RuntimeClass`; sandbox requests cannot override it.
+- `OPENSHELL_GRPC_ENDPOINT` is exactly
+  `https://127.0.0.1:<TNG listen port>`.
+- `OPENSHELL_K8S_TNG_VERIFIER_ADDRESS` is a private IPv4 address and
+  `OPENSHELL_K8S_TNG_CALLBACK_BIND_ADDRESS` is a loopback address on the same
+  port as the Pod-side TNG listener.
+- `OPENSHELL_CLIENT_TLS_SECRET_NAME` names the existing sandbox TLS secret.
+
+TNG listens on `127.0.0.1` inside the Pod and uses the guest attestation service
+at `127.0.0.1:8006`. The callback bind address is returned to the gateway as a
+listener requirement and is never placed in the Pod spec. Run the gateway with
+`--exclusive-sandbox-callback=true`; the gateway then accepts sandbox
+principals only on that distinct listener and rejects sandbox principals on
+the primary listener.
+
+Keep the primary listener unreachable from sandbox Pod networks. Callback
+scope isolation classifies sandbox bearer principals; a client certificate
+presented without a bearer token retains the upstream mTLS user semantics.
+
+Example standalone-driver environment:
+
+```shell
+export OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME=kata-remote
+export OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:17670
+export OPENSHELL_CLIENT_TLS_SECRET_NAME=openshell-client-tls
+export OPENSHELL_K8S_TNG_ENABLED=true
+export OPENSHELL_K8S_TNG_IMAGE=example.com/tng@sha256:<digest>
+export OPENSHELL_K8S_TNG_VERIFIER_ADDRESS=10.0.0.8
+export OPENSHELL_K8S_TNG_VERIFIER_PORT=9443
+export OPENSHELL_K8S_TNG_CALLBACK_BIND_ADDRESS=127.0.0.2:17670
+```
+
+Repeat `--operator-pod-annotation key=value` for cluster-owned annotations
+such as a pinned PodVM image and initdata selector. These values are applied
+after sandbox-authored annotations. Use
+`--workspace-access-mode ReadWriteOncePod` for an exclusive persistent
+workspace.
+
+The driver does not verify quotes, release keys, or persist attestation
+evidence. TNG and the configured verifier enforce the prompt/response channel;
+the guest attestation agent and Trustee policy remain the evidence boundary.
 
 The driver forwards the canonical main-process specification to the process
 supervisor and sets pod `restartPolicy: Never`. Main-process environment

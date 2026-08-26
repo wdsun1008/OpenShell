@@ -391,7 +391,18 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
+| `workspace_access_mode` | Not applicable | Set the generated workspace PVC to `ReadWriteOnce` (default) or `ReadWriteOncePod`. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+Confidential-cluster integrations can run the first-party Kubernetes driver as
+an operator-managed external process and select it with
+`--drivers kubernetes --compute-driver-socket <path>`. Its opt-in TNG settings
+pin the runtime class, rewrite the sandbox callback to Pod loopback, and request
+a distinct gateway callback listener. The confidential reference deployment
+also enables `[openshell.gateway] exclusive_sandbox_callback = true` to isolate
+sandbox callback principals; TNG does not enable that gateway option itself.
+Neither setting is enabled by the standard Helm chart. See the Kubernetes
+driver README for the standalone environment and trust-boundary details.
 
 Managed-mode Secret copying requires the gateway ServiceAccount to create
 Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so

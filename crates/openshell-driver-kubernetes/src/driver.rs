@@ -7,8 +7,8 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, validate_managed_namespace_name,
+    SupervisorSideloadMethod, SupervisorTopology, TngSidecarConfig, WorkspaceAccessMode,
+    WorkspaceMode, is_dns_1123_label, managed_namespace, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
@@ -171,6 +171,23 @@ impl KubernetesSandboxDriverConfig {
             )
         })
     }
+}
+
+fn validate_confidential_runtime_class_override(
+    template: &SandboxTemplate,
+    driver_config: &KubernetesSandboxDriverConfig,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled
+        && (platform_config_string(template, "runtime_class_name").is_some()
+            || !driver_config.pod.runtime_class_name.is_empty())
+    {
+        return Err(
+            "confidential Kubernetes sandboxes use the operator-managed runtime class; per-sandbox runtime_class_name overrides are not allowed"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -486,6 +503,9 @@ impl KubernetesComputeDriver {
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_confidential_runtime()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -550,6 +570,15 @@ impl KubernetesComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
         })
+    }
+
+    #[must_use]
+    pub fn gateway_callback_bind_address(&self) -> Option<std::net::SocketAddr> {
+        self.config
+            .tng
+            .enabled
+            .then_some(self.config.tng.callback_bind_address)
+            .flatten()
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -1195,9 +1224,21 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let _ = self
+        let driver_config = self
             .validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
+        if let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        {
+            validate_confidential_runtime_class_override(
+                template,
+                &driver_config,
+                self.config.tng.enabled,
+            )
+            .map_err(tonic::Status::invalid_argument)?;
+        }
         match self.config.workspace_mode {
             WorkspaceMode::Shared => {
                 validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
@@ -1402,6 +1443,7 @@ impl KubernetesComputeDriver {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
             image_pull_secrets: &self.config.image_pull_secrets,
+            pod_annotations: Some(&self.config.pod_annotations),
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
@@ -1428,6 +1470,7 @@ impl KubernetesComputeDriver {
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
+            workspace_access_mode: self.config.workspace_access_mode,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -1436,6 +1479,7 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            tng: self.config.tng.enabled.then_some(&self.config.tng),
         };
         validate_sidecar_proxy_identity(&params)?;
 
@@ -3162,6 +3206,7 @@ fn apply_workspace_persistence(
 fn default_workspace_volume_claim_templates(
     storage_size: &str,
     storage_class: &str,
+    access_mode: WorkspaceAccessMode,
 ) -> serde_json::Value {
     let size = if storage_size.is_empty() {
         DEFAULT_WORKSPACE_STORAGE_SIZE
@@ -3169,7 +3214,7 @@ fn default_workspace_volume_claim_templates(
         storage_size
     };
     let mut spec = serde_json::json!({
-        "accessModes": ["ReadWriteOnce"],
+        "accessModes": [access_mode.as_str()],
         "resources": {
             "requests": {
                 "storage": size
@@ -3193,6 +3238,7 @@ struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
     image_pull_secrets: &'a [String],
+    pod_annotations: Option<&'a BTreeMap<String, String>>,
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
@@ -3216,6 +3262,7 @@ struct SandboxPodParams<'a> {
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
+    workspace_access_mode: WorkspaceAccessMode,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -3226,6 +3273,7 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
+    tng: Option<&'a TngSidecarConfig>,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -3234,6 +3282,7 @@ impl Default for SandboxPodParams<'_> {
             default_image: "",
             image_pull_policy: "",
             image_pull_secrets: &[],
+            pod_annotations: None,
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -3257,12 +3306,14 @@ impl Default for SandboxPodParams<'_> {
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
+            workspace_access_mode: WorkspaceAccessMode::default(),
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            tng: None,
         }
     }
 }
@@ -3358,6 +3409,7 @@ fn sandbox_to_k8s_spec(
             default_workspace_volume_claim_templates(
                 params.workspace_default_storage_size,
                 params.workspace_storage_class,
+                params.workspace_access_mode,
             ),
         );
     }
@@ -3379,9 +3431,105 @@ fn sandbox_to_k8s_spec(
         );
     }
 
+    if let Some(tng) = params.tng {
+        let user_id = match params.topology {
+            SupervisorTopology::Combined => params.sandbox_uid,
+            SupervisorTopology::Sidecar => effective_sidecar_proxy_uid(params),
+        };
+        let pod = root
+            .get_mut("podTemplate")
+            .ok_or_else(|| "TNG requires a rendered podTemplate".to_string())?;
+        apply_tng_sidecar(pod, tng, user_id, params.sandbox_gid)?;
+    }
+
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))
+}
+
+fn apply_tng_sidecar(
+    pod: &mut serde_json::Value,
+    config: &TngSidecarConfig,
+    user_id: u32,
+    group_id: u32,
+) -> Result<(), String> {
+    let spec = pod
+        .get_mut("spec")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "TNG requires a Pod spec object".to_string())?;
+    for field in ["containers", "initContainers"] {
+        if spec
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|containers| {
+                containers.iter().any(|container| {
+                    container.get("name").and_then(serde_json::Value::as_str) == Some("tng")
+                })
+            })
+        {
+            return Err("Pod already contains a container named tng".to_string());
+        }
+    }
+
+    let verifier = config
+        .verifier_address
+        .expect("validated TNG config has a verifier address");
+    let tng_config = serde_json::json!({
+        "add_ingress": [{
+            "mapping": {
+                "in": {"host": "127.0.0.1", "port": config.listen_port},
+                "out": {"host": verifier.to_string(), "port": config.verifier_port}
+            },
+            "attest": {
+                "model": "background_check",
+                "aa_provider": "coco_asr",
+                "asr_addr": "http://127.0.0.1:8006"
+            }
+        }]
+    });
+    let listen_port_hex = format!("{:04X}", config.listen_port);
+    let listener_probe = format!(
+        "awk '$2 ~ /:{listen_port_hex}$/ && $4 == \"0A\" {{ found=1 }} END {{ exit !found }}' /proc/net/tcp /proc/net/tcp6"
+    );
+    let mut sidecar = serde_json::json!({
+        "name": "tng",
+        "image": config.image,
+        "command": ["tng", "launch", "--config-content", tng_config.to_string()],
+        "ports": [{
+            "name": "tng-local",
+            "containerPort": config.listen_port,
+            "protocol": "TCP"
+        }],
+        "restartPolicy": "Always",
+        "startupProbe": {
+            "exec": {"command": ["/bin/sh", "-ec", listener_probe]},
+            "periodSeconds": 1,
+            "timeoutSeconds": 1,
+            "failureThreshold": 60
+        },
+        "readinessProbe": {
+            "exec": {"command": ["/bin/sh", "-ec", listener_probe]},
+            "periodSeconds": 2,
+            "timeoutSeconds": 1,
+            "failureThreshold": 3
+        },
+        "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"]},
+            "runAsNonRoot": user_id != 0,
+            "runAsUser": user_id,
+            "runAsGroup": group_id
+        }
+    });
+    if !config.image_pull_policy.is_empty() {
+        sidecar["imagePullPolicy"] = serde_json::json!(config.image_pull_policy);
+    }
+    spec.entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "Pod spec initContainers must be an array".to_string())?
+        .push(sidecar);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3469,6 +3617,13 @@ fn sandbox_template_to_k8s_with_validated_config(
             _ => None,
         })
         .unwrap_or_default();
+    if let Some(operator_annotations) = params.pod_annotations {
+        pod_annotations.extend(
+            operator_annotations
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone()))),
+        );
+    }
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
             "openshell.io/sandbox-id".to_string(),
@@ -3483,15 +3638,19 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
 
     let mut spec = serde_json::Map::new();
-    let runtime_class_name = platform_config_string(template, "runtime_class_name")
-        .or_else(|| {
-            (!driver_config.pod.runtime_class_name.is_empty())
-                .then(|| driver_config.pod.runtime_class_name.clone())
-        })
-        .or_else(|| {
-            (!params.default_runtime_class_name.is_empty())
-                .then(|| params.default_runtime_class_name.to_string())
-        });
+    let runtime_class_name = if params.tng.is_some() {
+        Some(params.default_runtime_class_name.to_string())
+    } else {
+        platform_config_string(template, "runtime_class_name")
+            .or_else(|| {
+                (!driver_config.pod.runtime_class_name.is_empty())
+                    .then(|| driver_config.pod.runtime_class_name.clone())
+            })
+            .or_else(|| {
+                (!params.default_runtime_class_name.is_empty())
+                    .then(|| params.default_runtime_class_name.to_string())
+            })
+    };
     if let Some(runtime_class) = runtime_class_name {
         spec.insert(
             "runtimeClassName".to_string(),
@@ -4725,6 +4884,22 @@ mod tests {
             .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))?
             .get("value")?
             .as_str()
+    }
+
+    fn tng_config() -> TngSidecarConfig {
+        TngSidecarConfig {
+            enabled: true,
+            image: concat!(
+                "registry.example.com/tng@sha256:",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .to_string(),
+            image_pull_policy: "IfNotPresent".to_string(),
+            listen_port: 17_670,
+            verifier_address: Some("10.0.0.8".parse().unwrap()),
+            verifier_port: 9_443,
+            callback_bind_address: Some("127.0.0.2:17670".parse().unwrap()),
+        }
     }
 
     #[test]
@@ -6430,6 +6605,53 @@ mod tests {
     }
 
     #[test]
+    fn confidential_runtime_rejects_all_sandbox_runtime_class_overrides() {
+        let templates = [
+            SandboxTemplate {
+                platform_config: Some(json_struct(serde_json::json!({
+                    "runtime_class_name": "runc"
+                }))),
+                ..SandboxTemplate::default()
+            },
+            SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "pod": {"runtime_class_name": "gvisor"}
+                }))),
+                ..SandboxTemplate::default()
+            },
+        ];
+
+        for template in templates {
+            let driver_config = KubernetesSandboxDriverConfig::from_template(&template).unwrap();
+            let error =
+                validate_confidential_runtime_class_override(&template, &driver_config, true)
+                    .unwrap_err();
+            assert!(error.contains("operator-managed runtime class"));
+            validate_confidential_runtime_class_override(&template, &driver_config, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn confidential_runtime_always_renders_the_operator_runtime_class() {
+        let tng = tng_config();
+        let template = SandboxTemplate::default();
+        let params = SandboxPodParams {
+            default_runtime_class_name: "kata-remote",
+            tng: Some(&tng),
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(pod["spec"]["runtimeClassName"], "kata-remote");
+    }
+
+    #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
@@ -7364,16 +7586,113 @@ mod tests {
 
     #[test]
     fn default_workspace_vct_uses_provided_storage_size() {
-        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        let vct =
+            default_workspace_volume_claim_templates("5Gi", "", WorkspaceAccessMode::ReadWriteOnce);
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, "5Gi");
     }
 
     #[test]
     fn default_workspace_vct_falls_back_to_const_when_empty() {
-        let vct = default_workspace_volume_claim_templates("", "");
+        let vct =
+            default_workspace_volume_claim_templates("", "", WorkspaceAccessMode::ReadWriteOnce);
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn confidential_workspace_supports_rwop() {
+        let rwop = default_workspace_volume_claim_templates(
+            "40Gi",
+            "encrypted-storage",
+            WorkspaceAccessMode::ReadWriteOncePod,
+        );
+        assert_eq!(rwop[0]["spec"]["accessModes"][0], "ReadWriteOncePod");
+    }
+
+    #[test]
+    fn operator_annotations_override_sandbox_authored_values() {
+        let template = SandboxTemplate {
+            platform_config: Some(json_struct(serde_json::json!({
+                "annotations": {
+                    "io.katacontainers.config.hypervisor.image": "untrusted-image"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+        let operator_annotations = BTreeMap::from([
+            (
+                "io.katacontainers.config.hypervisor.image".to_string(),
+                "trusted-image".to_string(),
+            ),
+            (
+                "io.katacontainers.config.hypervisor.cc_init_data".to_string(),
+                String::new(),
+            ),
+        ]);
+        let params = SandboxPodParams {
+            pod_annotations: Some(&operator_annotations),
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod["metadata"]["annotations"]["io.katacontainers.config.hypervisor.image"],
+            "trusted-image"
+        );
+        assert_eq!(
+            pod["metadata"]["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"],
+            ""
+        );
+    }
+
+    #[test]
+    fn tng_starts_after_workspace_preparation_and_gates_pod_readiness() {
+        let tng = tng_config();
+        let params = SandboxPodParams {
+            default_runtime_class_name: "kata-remote",
+            sandbox_uid: 1_500,
+            sandbox_gid: 1_600,
+            tng: Some(&tng),
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(None, &params);
+        let pod = &cr["spec"]["podTemplate"];
+        let init_containers = pod["spec"]["initContainers"].as_array().unwrap();
+        assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
+        let sidecar = init_containers.last().unwrap();
+        assert_eq!(sidecar["name"], "tng");
+        assert_eq!(sidecar["restartPolicy"], "Always");
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 1_500);
+        assert!(sidecar["startupProbe"].is_object());
+        assert!(sidecar["readinessProbe"].is_object());
+
+        let config: serde_json::Value =
+            serde_json::from_str(sidecar["command"][3].as_str().unwrap()).unwrap();
+        assert_eq!(
+            config["add_ingress"][0]["mapping"]["in"],
+            serde_json::json!({"host": "127.0.0.1", "port": 17670})
+        );
+        assert_eq!(
+            config["add_ingress"][0]["mapping"]["out"],
+            serde_json::json!({"host": "10.0.0.8", "port": 9443})
+        );
+        assert_eq!(
+            config["add_ingress"][0]["attest"]["asr_addr"],
+            "http://127.0.0.1:8006"
+        );
+        assert!(
+            !serde_json::to_string(pod)
+                .unwrap()
+                .contains("127.0.0.2:17670"),
+            "the trusted-host callback address must not be injected into the Pod"
+        );
     }
 
     #[test]
@@ -7602,13 +7921,18 @@ mod tests {
 
     #[test]
     fn default_workspace_vct_sets_storage_class_when_provided() {
-        let vct = default_workspace_volume_claim_templates("5Gi", "fast-ssd");
+        let vct = default_workspace_volume_claim_templates(
+            "5Gi",
+            "fast-ssd",
+            WorkspaceAccessMode::ReadWriteOnce,
+        );
         assert_eq!(vct[0]["spec"]["storageClassName"], "fast-ssd");
     }
 
     #[test]
     fn default_workspace_vct_omits_storage_class_when_empty() {
-        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        let vct =
+            default_workspace_volume_claim_templates("5Gi", "", WorkspaceAccessMode::ReadWriteOnce);
         assert!(vct[0]["spec"].get("storageClassName").is_none());
     }
 
