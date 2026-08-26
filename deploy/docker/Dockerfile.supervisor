@@ -22,7 +22,7 @@
 # The binary is static under either supported libc variant (`SUPERVISOR_LIBC`:
 # musl by default, or glibc-static), so this Alpine base runs it unchanged.
 
-FROM alpine:3.22 AS supervisor
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS supervisor
 
 ARG TARGETARCH
 
