@@ -210,6 +210,12 @@ fn telemetry_compute_driver(
     TelemetryComputeDriver::from_driver_kind(driver_kind)
 }
 
+fn should_mint_initial_sandbox_token(
+    driver_kind: Option<openshell_core::ComputeDriverKind>,
+) -> bool {
+    driver_kind != Some(openshell_core::ComputeDriverKind::Kubernetes)
+}
+
 async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
@@ -345,20 +351,22 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
-    // this mint and bootstrap via `IssueSandboxToken` at supervisor
-    // startup; identifying "is this K8s?" lives in the compute layer, so
-    // we mint unconditionally here when the issuer is configured and let
-    // the K8s driver simply ignore the field.
-    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
-        issuer.mint(&id).map(|minted| {
-            tracing::info!(
-                sandbox_id = %id,
-                "minted sandbox JWT"
-            );
-            minted.token
-        })
-    });
+    // Kubernetes sandboxes bootstrap from their projected ServiceAccount
+    // token through `IssueSandboxToken`; do not materialize an unused gateway
+    // JWT in the request sent to that external driver.
+    let sandbox_token = state
+        .sandbox_jwt_issuer
+        .as_ref()
+        .filter(|_| should_mint_initial_sandbox_token(state.compute.driver_kind()))
+        .map(|issuer| {
+            issuer.mint(&id).map(|minted| {
+                tracing::info!(
+                    sandbox_id = %id,
+                    "minted sandbox JWT"
+                );
+                minted.token
+            })
+        });
     let sandbox_token = match sandbox_token {
         Some(Ok(token)) => Some(token),
         Some(Err(status)) => return Err(status),
@@ -2480,6 +2488,21 @@ mod tests {
             telemetry_compute_driver(None),
             TelemetryComputeDriver::Unknown
         );
+    }
+
+    #[test]
+    fn kubernetes_uses_projected_service_account_token_for_bootstrap() {
+        assert!(!should_mint_initial_sandbox_token(Some(
+            openshell_core::ComputeDriverKind::Kubernetes
+        )));
+        for driver in [
+            None,
+            Some(openshell_core::ComputeDriverKind::Docker),
+            Some(openshell_core::ComputeDriverKind::Podman),
+            Some(openshell_core::ComputeDriverKind::Vm),
+        ] {
+            assert!(should_mint_initial_sandbox_token(driver));
+        }
     }
 
     #[test]

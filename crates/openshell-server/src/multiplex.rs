@@ -857,7 +857,7 @@ where
 /// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — exchanges a projected SA token for a `Principal::Sandbox` so the
 ///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
+///    other path; only present when Kubernetes is the selected compute driver.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the

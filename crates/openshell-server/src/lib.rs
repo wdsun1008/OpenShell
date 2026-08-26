@@ -48,7 +48,6 @@ mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-#[cfg(target_os = "windows")]
 use openshell_core::ComputeDriverKind;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -313,8 +312,8 @@ pub struct ServerState {
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
     /// Optional K8s `ServiceAccount` authenticator that backs the
-    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
-    /// runs in-cluster.
+    /// `IssueSandboxToken` bootstrap path. Present when Kubernetes is the
+    /// selected compute driver and sandbox JWT issuing is configured.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
@@ -660,13 +659,14 @@ pub(crate) async fn run_server(
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    // K8s ServiceAccount bootstrap authenticator. Only constructed when
-    // the gateway is running in-cluster (kubelet provides the API host
-    // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't call the apiserver's TokenReview API,
-    // and without the issuer there's nothing to exchange the SA token for.
+    // K8s ServiceAccount bootstrap authenticator. The selected Kubernetes
+    // driver may run out-of-cluster, so let kube::Client use either in-cluster
+    // credentials or an explicit KUBECONFIG. Without the issuer there is
+    // nothing to exchange the projected SA token for.
     #[cfg(not(target_os = "windows"))]
-    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+    if state.sandbox_jwt_issuer.is_some()
+        && state.compute.driver_kind() == Some(ComputeDriverKind::Kubernetes)
+    {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
         let kubernetes_config =
@@ -675,28 +675,24 @@ pub(crate) async fn run_server(
         let sandbox_service_account = kubernetes_config.service_account_name.clone();
         let namespace_validator =
             kubernetes_namespace_validator(&kubernetes_config, &operator_allowlist)?;
-        match kube::Client::try_default().await {
-            Ok(client) => {
-                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
-                    client,
-                    namespace_validator,
-                    "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
-                ));
-                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
-                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
-                info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
-                    "K8s ServiceAccount bootstrap authenticator enabled"
-                );
-            }
-            Err(e) => warn!(
-                error = %e,
-                "in-cluster K8s client construction failed; \
-                 K8s ServiceAccount bootstrap is disabled"
-            ),
-        }
+        let client = kube::Client::try_default().await.map_err(|error| {
+            Error::config(format!(
+                "Kubernetes ServiceAccount bootstrap client construction failed: {error}"
+            ))
+        })?;
+        let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
+            client,
+            namespace_validator,
+            "openshell-gateway".to_string(),
+            sandbox_service_account.clone(),
+        ));
+        let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
+        state.k8s_sa_authenticator = Some(Arc::new(authenticator));
+        info!(
+            namespace = %sandbox_namespace,
+            service_account = %sandbox_service_account,
+            "K8s ServiceAccount bootstrap authenticator enabled"
+        );
     }
 
     let state = Arc::new(state);

@@ -100,12 +100,12 @@ pub fn kubernetes_sa_bootstrap_config(
 ) -> Result<KubernetesSaBootstrapConfig> {
     let Some(file) = file else {
         return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when Kubernetes and sandbox JWT issuing are enabled",
         ));
     };
     if !file.openshell.drivers.contains_key("kubernetes") {
         return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when Kubernetes and sandbox JWT issuing are enabled",
         ));
     }
     let merged = config_file::driver_table(
